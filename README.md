@@ -4,7 +4,7 @@ build:
 
 cd ns-allinone-3.44/ns-3.44
 
-./ns3 configure --enable-examples --enable-tests --with-python-bindings
+./ns3 configure --enable-examples --with-python-bindings
 
 ./ns3 build
 
