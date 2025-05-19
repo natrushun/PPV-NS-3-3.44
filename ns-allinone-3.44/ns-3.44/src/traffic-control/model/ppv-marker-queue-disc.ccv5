@@ -1,0 +1,388 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2017 Universita' degli Studi di Napoli Federico II
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * Authors:  Stefano Avallone <stavallo@unina.it>
+ */
+ 
+/*
+Copyfrom p-marker-v5
+*/
+
+#include "ns3/log.h"
+#include "ppv-marker-queue-disc.h"
+#include "ns3/object-factory.h"
+#include "ns3/drop-tail-queue.h"
+
+
+namespace ns3 {
+#define MAXPPV (1000000 * 4298662.34708228) // 10^6 * ppovgoldmax  by definition
+
+NS_LOG_COMPONENT_DEFINE ("PpvMarkerQueueDisc");
+
+NS_OBJECT_ENSURE_REGISTERED (PpvMarkerQueueDisc);
+
+TypeId PpvMarkerQueueDisc::GetTypeId (void)
+{
+  static TypeId tid = TypeId ("ns3::PpvMarkerQueueDisc")
+    .SetParent<QueueDisc> ()
+    .SetGroupName ("TrafficControl")
+    .AddConstructor<PpvMarkerQueueDisc> ()
+    // .AddAttribute ("MaxSize",
+                   // "The max queue size",
+                   // QueueSizeValue (QueueSize ("100000p")),
+                   // MakeQueueSizeAccessor (&QueueDisc::SetMaxSize,
+                                          // &QueueDisc::GetMaxSize),
+                   // MakeQueueSizeChecker ())
+    .AddAttribute ("PpovPointsFile",
+                   "Filename, that describes a ppov curve point-by-point.",
+                   StringValue ("XX.txt"),
+                   MakeStringAccessor (&PpvMarkerQueueDisc::PpovPointsFile),
+                   MakeStringChecker ())
+    .AddAttribute ("MarkerMode",
+                   "Mode defines how long the selective ppov range is applied.",
+                   UintegerValue (1),
+                   MakeUintegerAccessor (&PpvMarkerQueueDisc::mode),
+                   MakeUintegerChecker<uint32_t> ())
+    .AddAttribute ("TbTime",
+                   "Lenght of the Token Bucket in seconds.",
+                   DoubleValue (0.04),
+                   MakeDoubleAccessor (&PpvMarkerQueueDisc::tb_time),
+                   MakeDoubleChecker<float> ())
+    .AddAttribute ("TbTarget",
+                   "Lenght of the Token Bucket in bytes.",
+                   UintegerValue (5*1500),
+                   MakeUintegerAccessor (&PpvMarkerQueueDisc::tb_target),
+                   MakeUintegerChecker<uint32_t> ())
+    .AddAttribute ("Kappa",
+                   "Kappa constant used in bandwidth estimation",
+                   DoubleValue (0.2),
+                   MakeDoubleAccessor (&PpvMarkerQueueDisc::kappa),
+                   MakeDoubleChecker<float> ())
+	.AddAttribute ("DClass",
+                   "DClass marking",
+                   UintegerValue (0),
+                   MakeUintegerAccessor (&PpvMarkerQueueDisc::dclass),
+                   MakeUintegerChecker<uint8_t> ())
+    ;
+  return tid;
+}
+
+PpvMarkerQueueDisc::PpvMarkerQueueDisc ()
+  : QueueDisc (QueueDiscSizePolicy::NO_LIMITS ),
+  m_packets ()
+{
+  NS_LOG_FUNCTION (this);
+  R = 0.0; //10000000.0/8.0; // 10 Mbps
+  R_old = R;
+  tb_time = 0.040; // 40 ms 
+  tb_dmax = 1500;//tb_time * R;
+  tb_d = 0;//tb_dmax/2;
+  alpha = 0.9;
+  tlast = 0.0;
+  mode = 1;
+  tb_target = 5*1500; //byte
+  dclass = 0;
+
+  kappa = 2.0;
+  last_delta = 1.0;
+  
+  rnd = CreateObject<UniformRandomVariable> ();
+  initialized = false;
+  //ReadPpovFromFile(PpovPointsFile);
+  
+  // std::cout << "PpvMarkerQueueDisc::PpvMarkerQueueDisc ()\n";
+}
+
+PpvMarkerQueueDisc::~PpvMarkerQueueDisc ()
+{
+  NS_LOG_FUNCTION (this);
+  std::cout << "DESTROY PpvMarkerQueueDisc::PpvMarkerQueueDisc ()\n";
+	
+}
+
+bool
+PpvMarkerQueueDisc::DoEnqueue (Ptr<QueueDiscItem> item)
+{
+	// https://stackoverflow.com/questions/59040124/how-to-extract-ip-address-from-queuediscitem-in-ns3
+ 
+	NS_LOG_FUNCTION (this << item);
+    // NS_ASSERT (m_packets.size () == GetNPackets ());
+
+    NS_LOG_LOGIC ("PPV-MARKER Npackets" << GetNPackets());
+
+	// std::cout<<"MarkerEnQ: "<< Simulator::Now ().GetSeconds ()<<std::endl;
+	
+	Ptr<const Ipv4QueueDiscItem> ipItem = DynamicCast<const Ipv4QueueDiscItem>(item);
+		
+    Ptr<Packet> p = item->GetPacket();
+	
+	// std::cout << "-----BEFORE: " << item->GetSize() << std::endl;
+
+	Ipv4Header ipHeader = ipItem->GetHeader();
+
+    int markerColor = calcCodedPacketValueFromRateBps(getColor(p)); // TODO: Rename getRndRate
+
+    NS_LOG_LOGIC ("PPV-MARKER-COLOR " << markerColor);
+    // std::cout<<"PPV-MARKER-COLOR " << markerColor<<std::endl;
+
+    ipHeader.SetIdentification(markerColor);
+	ipHeader.SetTos(1);
+	// ipHeader.SetTos(markerColor);
+
+    ipHeader.EnableChecksum();
+
+	Ptr<Ipv4QueueDiscItem> newItem = new Ipv4QueueDiscItem(p,item->GetAddress(),item->GetProtocol(),ipHeader);
+	
+    // m_packets.push (newItem);
+
+	// std::cout << "------AFTER: " << newItem->GetSize() << std::endl;
+
+	
+	//feleseleges queue tarolas, de kell a statisztikajaba
+	bool retval = GetInternalQueue (0)->Enqueue (newItem);
+
+	return retval;
+  /*
+  if (GetCurrentSize () + item > GetMaxSize ())
+    {
+      NS_LOG_LOGIC ("Queue full -- dropping pkt");
+      DropBeforeEnqueue (item, LIMIT_EXCEEDED_DROP);
+      return false;
+    }
+
+	bool retval = GetInternalQueue (0)->Enqueue (item);  
+
+  // If Queue::Enqueue fails, QueueDisc::DropBeforeEnqueue is called by the
+  // internal queue because QueueDisc::AddInternalQueue sets the trace callback
+
+  NS_LOG_LOGIC ("Number packets " << GetInternalQueue (0)->GetNPackets ());
+  NS_LOG_LOGIC ("Number bytes " << GetInternalQueue (0)->GetNBytes ());
+
+  return retval;*/
+}
+
+Ptr<QueueDiscItem>
+PpvMarkerQueueDisc::DoDequeue (void)
+{
+	NS_LOG_FUNCTION (this);
+    // NS_ASSERT (m_packets.size () == GetNPackets ());
+
+    NS_LOG_LOGIC ("DoDequeue Size " << m_packets.size () << " " << GetInternalQueue(0)->GetNPackets());
+	// std::cout<<"MarkerDeQ: "<< Simulator::Now ().GetSeconds ()<<std::endl;
+	
+	// if (m_packets.size () == 0) {
+		  // NS_LOG_LOGIC ("Queue empty");
+		  // return 0;
+	// }
+
+	// Ptr<QueueDiscItem> item = m_packets.front ();
+	// m_packets.pop ();
+
+	//feleseleges queue tarolas, de kell a statisztikajaba
+	Ptr<QueueDiscItem> item = GetInternalQueue (0)->Dequeue ();
+
+    return item;
+/*	NS_LOG_FUNCTION (this);
+
+	Ptr<QueueDiscItem> item = GetInternalQueue (0)->Dequeue ();
+
+  if (!item)
+    {
+      NS_LOG_LOGIC ("Queue empty");
+      return 0;
+    }
+
+  return item;*/
+}
+
+Ptr<const QueueDiscItem>
+PpvMarkerQueueDisc::DoPeek (void)
+{
+  NS_LOG_FUNCTION (this);
+  // NS_ASSERT (m_packets.size () == GetNPackets ());
+  
+  // return m_packets.front ();
+
+  Ptr<const QueueDiscItem> item = GetInternalQueue (0)->Peek ();
+
+  if (!item)
+    {
+      NS_LOG_LOGIC ("Queue empty");
+      return 0;
+    }
+
+  return item;
+}
+
+bool
+PpvMarkerQueueDisc::CheckConfig (void)
+{
+  NS_LOG_FUNCTION (this);
+  if (GetNQueueDiscClasses () > 0)
+    {
+      NS_LOG_ERROR ("PpvMarkerQueueDisc cannot have classes");
+      return false;
+    }
+
+  if (GetNPacketFilters () > 0)
+    {
+      NS_LOG_ERROR ("PpvMarkerQueueDisc needs no packet filter");
+      return false;
+    }
+
+  if (GetNInternalQueues () == 0)
+    {
+      // add a DropTail queue
+      // AddInternalQueue (CreateObjectWithAttributes<DropTailQueue<QueueDiscItem> >
+                          // ("MaxSize", QueueSizeValue (GetMaxSize ())));
+      AddInternalQueue (CreateObjectWithAttributes<DropTailQueue<QueueDiscItem> >
+                          ("MaxSize", StringValue ("100000p")));
+    }
+
+  if (GetNInternalQueues () != 1)
+    {
+      NS_LOG_ERROR ("PpvMarkerQueueDisc needs 1 internal queue");
+      return false;
+    }
+
+  return true;
+}
+
+void
+PpvMarkerQueueDisc::InitializeParams (void)
+{
+  NS_LOG_FUNCTION (this);
+}
+
+float PpvMarkerQueueDisc::getColor(Ptr<Packet> p) {
+  // NS_LOG_LOGIC ("Ppv-marker getColor npackets" << GetNPackets());
+
+  if(!initialized){
+      ReadPpovFromFile(PpovPointsFile);
+      initialized = true;
+      std::cout << "---### tb_time: " << tb_time
+                << " tb_target: " << tb_target
+                << " file: " << PpovPointsFile
+                << " mode: " << mode << " ###---\n";
+  }
+
+  float color = 0.0; 
+  int packetsize = p->GetSize();
+  float tnow = Simulator::Now ().GetSeconds ();
+  float dt = tnow - tlast;
+
+  tlast = tnow;
+
+  //R_old = R;
+  float R_ref = 0.0;
+  
+  if (dt>0.0) {
+	  R_old = R;
+	  R = (1-exp(-1.0*dt/kappa))*packetsize/dt + exp(-1.0*dt/kappa)*R_old;
+	  last_delta = dt;
+  } else {
+	  R += (1-exp(-1.0*last_delta/kappa))*packetsize/last_delta;
+	  dt = last_delta; // just for printing
+  }
+  
+  if (mode==0)
+  {
+	  if (R/(R_old+1.0) > 1.5)
+		  R_ref = R_old;
+  }
+  
+  color = (float)rnd->GetValue((double)R_ref,(double)R);
+
+
+  // std::cout << "PpvMarkerQueueDisc::getColor object: " << this << " t: " << tnow << " dt: " << dt << " R: " << R << " R_old: " << R_old << " tb_d: " << tb_d  << " tb_dmax: " << tb_dmax;
+  // std::cout << std::fixed << " color: " << color << " ppv: " << (int)calcCodedPacketValueFromRateBps(color) << " packetsize: " << packetsize << std::endl;
+  return color;
+}
+
+ int PpvMarkerQueueDisc::calcCodedPacketValueFromRateBps(double rateBps) {
+     return convertToLogScale(calcPacketValue(rateBps));
+ }
+
+int PpvMarkerQueueDisc::convertToLogScale(double color) {
+    if(color < 1 || color > MAXPPV)
+        throw "Error! Cannot convert color to a log scale - input is out of range.";
+    double b = log10(color) / log10(MAXPPV);
+    return (int)((b * 65535) +1);
+}
+
+// any unnecessary write to the stdout will probably mess up the post processing
+double PpvMarkerQueueDisc::calcPacketValue(double throughput) {
+
+  throughput =  throughput * 8 / 1000; // byte p s -> kbps conversion
+
+  if ( throughput > ppov.back().first) {
+    throw "Error! This packet's color is greater than the highest defined - would have ppv: 0 - Aborting!";
+    return 0; // unreachable
+  } else if (throughput < ppov.front().first) {
+    return ppov.front().second;
+  }
+
+  int section = -1; // watch for indexing!!
+  for(std::vector< std::pair<float, float> >::iterator it = ppov.begin(); it != ppov.end(); ++it)
+    if ((*it).first < throughput)
+      ++section;
+
+  if(-1 == section && throughput == ppov.front().first)
+    section = 0;
+
+  double pow = ( std::log10( ppov[section +1].second / ppov[section].second ) ) /
+               ( std::log10( ppov[section +1].first  / ppov[section].first  ) );
+
+  double res = ppov[section].second * (std::pow( ( throughput / ppov[section].first ), pow));
+  // std::cout << "   POW: " << pow << "  RES: " << res  << "   " << std::flush;
+
+  if (std::isnan(res))
+    throw "Error! Calculated pv is nan!";
+  if (std::isinf(res))
+    throw "Error! Owerflow during calcPacketValue!";
+
+  return res;
+}
+
+
+// needs to be called
+bool PpvMarkerQueueDisc::ReadPpovFromFile(std::string path) {
+  NS_LOG_LOGIC ("ppovfilename ::: " << PpovPointsFile );
+  std::cout << "ppovfilename ::: " << PpovPointsFile << std::endl;
+  float thr, ppv;
+  std::ifstream infile (PpovPointsFile.c_str());
+  if (infile.is_open())
+  {
+    while ( infile >> thr, infile >> ppv ) {
+      if (ppv > MAXPPV)
+        throw "Error! Too high PV defined in the input file!";
+      ppov.push_back(std::make_pair(thr, ppv));
+      NS_LOG_LOGIC ("ppvpoint ::: t: " << thr << "  ppv: " << ppv);
+    }
+    if (ppov.size() < 2) {
+      throw "Error! The ppov.txt file does not contain enugh points!";
+    }
+    return true;
+  } else {
+    std::cout << "Unable to open file";
+    throw "Error! The input ppov.txt file could not be opened!\n"
+          "Please check the scratch folder!";
+    return false; // unreachable
+  }
+}
+
+} // namespace ns3
